@@ -1,0 +1,27 @@
+{
+  "name": "linkd-mcp-server",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "bin": {
+    "linkd-mcp-server": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --clean --minify",
+    "start": "node dist/index.js",
+    "dev": "tsup src/index.ts --format esm --watch"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "linkd-ts-sdk": "file:../linkd-ts-sdk",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}

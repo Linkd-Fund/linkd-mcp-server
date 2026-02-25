@@ -4,7 +4,8 @@ import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { LinkdSDK } from "linkd-ts-sdk";
+import { LinkdSDK, generateExpenditureHash } from "linkd-ts-sdk";
+import { Horizon } from "@stellar/stellar-sdk";
 import { z } from "zod";
 
 const sdk = new LinkdSDK({
@@ -68,6 +69,14 @@ const GetStatusSchema = z.object({
     contractId: z.string(),
 });
 
+const AuditExpenditureSchema = z.object({
+    invoiceNumber: z.string().describe("The unique invoice number for the expenditure"),
+    amount: z.number().positive().describe("The expenditure amount"),
+    supplierName: z.string().describe("The name of the supplier"),
+    donorIds: z.array(z.string()).min(1).describe("Array of donor wallet/account IDs"),
+    stellarTxHash: z.string().describe("The Stellar transaction hash where the memo was anchored"),
+});
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
         tools: [
@@ -110,6 +119,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 name: "get_escrow_status",
                 description: "Retrieves real-time on-chain status (total escrowed, milestone count).",
                 inputSchema: { type: "object", properties: {}, ...GetStatusSchema.shape },
+            },
+            {
+                name: "audit_expenditure_anchor",
+                description: "Cross-layer audit: recomputes the deterministic expenditure hash and verifies it matches the memo anchored on the Stellar ledger. Returns a strict JSON audit report.",
+                inputSchema: { type: "object", properties: {}, ...AuditExpenditureSchema.shape },
             },
         ],
     };
@@ -160,6 +174,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const total = await sdk.escrow.getTotalEscrowed(args.contractId);
                 const count = await sdk.escrow.getMilestoneCount(args.contractId);
                 return { content: [{ type: "text", text: `Live Ledger State:\n- Total Escrowed: ${total}\n- Milestone Count: ${count}` }] };
+            }
+            case "audit_expenditure_anchor": {
+                const args = AuditExpenditureSchema.parse(rawArgs);
+
+                // Step A: Deterministically recompute the expected hash from the bundle.
+                const expectedHash = generateExpenditureHash(
+                    args.invoiceNumber,
+                    args.amount,
+                    args.supplierName,
+                    args.donorIds
+                );
+
+                // Step B: Fetch the transaction record from the Stellar Horizon network.
+                const horizonUrl = "https://horizon-testnet.stellar.org";
+                const horizonServer = new Horizon.Server(horizonUrl);
+                const tx = await horizonServer.transactions().transaction(args.stellarTxHash).call();
+
+                // Step C: Extract the on-chain memo. MEMO_HASH is returned as a
+                // base64-encoded Buffer by stellar-sdk; convert to hex for comparison.
+                let onChainHash: string;
+                if (tx.memo_type === "hash" && tx.memo) {
+                    const memoBytes = Buffer.from(tx.memo, "base64");
+                    onChainHash = memoBytes.toString("hex");
+                } else {
+                    // Treat a missing or non-hash memo as an empty string so the
+                    // audit deterministically fails with a meaningful diff.
+                    onChainHash = "";
+                }
+
+                // Step D: Compare hashes and build the audit report.
+                const auditPassed = expectedHash === onChainHash;
+                const report = {
+                    audit_passed: auditPassed,
+                    expected_hash: expectedHash,
+                    on_chain_hash: onChainHash,
+                    variance_detected: !auditPassed,
+                };
+
+                return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
             }
             default:
                 throw new Error(`Unrecognized tool: ${name}`);

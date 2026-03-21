@@ -1,56 +1,141 @@
-# Linkdfund Accountability Protocol: MCP Server
+# linkd-mcp-server
 
-A Model Context Protocol (MCP) interface providing autonomous agents with deterministic access to the Linkdfund Soroban Escrow primitive. This service acts as a secure routing and validation layer between AI execution environments and the underlying blockchain utility SDK.
+Node.js / TypeScript — Model Context Protocol server exposing Linkdfund protocol tools to AI agents.
 
 > [!IMPORTANT]
 > **Non-Custodial Regulatory Disclaimer**: This software is provided as a set of non-custodial protocol tools and interfaces. It does not provide financial services, investment advice, or asset management. All transaction signing and private key management are handled locally by the user. This implementation is designed to align with the **Kenyan VASP Act 2025** standards for non-custodial decentralized protocols.
 
-## Architecture
+## What This Is
 
-* **Agentic Guardrails:** Implements strict runtime schema validation (Zod) across all tool invocations. Intercepts non-deterministic parameter generation and returns structured error boundaries, forcing autonomous self-correction without crashing the host process.
-* **Zero-Liability Execution:** Maintains the protocol's non-custodial architecture. The server constructs, simulates, and routes operations but never handles private keys or cryptographically signs transactions.
-* **Standardized Transport:** Utilizes `StdioServerTransport` for seamless integration into compliant agentic environments and developer workflows.
+Bridges the Linkdfund smart contract layer to any MCP-compatible AI client (Claude Desktop, Claude Code, custom agents). It:
 
-## Core Primitives Exposed
+1. Exposes Soroban contract operations as callable tools — each returns a base64 XDR envelope, never a signed transaction.
+2. Provides `audit_expenditure_anchor` for cross-layer cryptographic verification of expenditure bundles.
+3. Runs on stdio transport — no HTTP port, no persistent process, no authentication surface.
 
-The server exposes the following state-mutating and read-only primitives to authorized models:
+**It wraps `linkd-ts-sdk`. It does not contain business logic of its own.**
 
-* `init_escrow`: Constructs the initialization payload for the state machine.
-* `add_milestone`: Appends a funding tranche to an active contract.
-* `deposit_funds`: Structures the liquidity lock mechanism.
-* `submit_proof`: Routes verified cryptographic proof hashes (e.g., external ledger identifiers).
-* `approve_ngo` / `approve_auditor`: Exposes the dual-signature consensus mechanism for automated milestone sign-off.
-* `refund_milestone`: Provides administrative exception handling for stalled tranches.
-* `get_escrow_status`: Retrieves real-time ledger state and threshold metrics.
+## Source Structure
+
+```
+src/
+  index.ts    Single file — MCP server, tool registry, all handlers
+```
+
+## Tools Exposed
+
+| Tool | Auth Required | Returns | Description |
+|------|--------------|---------|-------------|
+| `init_escrow` | Admin keypair (external) | XDR string | Initialize Soroban escrow contract with roles and token |
+| `add_milestone` | Admin keypair (external) | XDR string | Append a funding milestone |
+| `deposit_funds` | Donor keypair (external) | XDR string | Lock SEP-41 tokens into escrow |
+| `submit_proof` | NGO keypair (external) | XDR string | Attach KRA eTIMS / IPFS proof hash to milestone |
+| `approve_ngo` | NGO keypair (external) | XDR string | NGO cryptographic sign-off on milestone |
+| `approve_auditor` | Auditor keypair (external) | XDR string | Auditor cryptographic sign-off — triggers fund release if NGO also approved |
+| `refund_milestone` | Admin keypair (external) | XDR string | Cancel stalled milestone, route capital to refund address |
+| `get_escrow_status` | None | Text report | Live on-chain read: total escrowed, milestone count, full state |
+| `audit_expenditure_anchor` | None | JSON audit report | Recompute bundle hash and verify against Stellar Memo.hash |
+
+All XDR-returning tools produce envelopes that must be signed externally before submission.
+
+## `audit_expenditure_anchor` — Cross-Layer Integrity Check
+
+This tool is the tamper-evidence proof. Given an expenditure bundle and its claimed Stellar transaction hash, it:
+
+1. Recomputes `generateExpenditureHash(invoiceNumber, amount, supplierName, donorIds)` — deterministic
+2. Fetches the Stellar transaction from Horizon by `stellarTxHash`
+3. Decodes `MEMO_HASH` (base64 → hex)
+4. Compares computed hash to on-chain hash
+
+```json
+{
+  "audit_passed": true,
+  "expected_hash": "a3f9...",
+  "on_chain_hash": "a3f9...",
+  "variance_detected": false
+}
+```
+
+`variance_detected: true` means the expenditure bundle was tampered or the wrong TX hash was supplied.
+
+> **Known Limitation**: The current implementation in `src/index.ts` passes raw donor IDs directly to `generateExpenditureHash()` instead of routing through `generateAnonymizedExpenditureHash()`. This produces a hash that diverges from the one anchored by `linkd-app` (which anonymizes donor IDs before hashing). The `audit_passed` result will be `false` for any real anchored expenditure until this is corrected to use `generateAnonymizedExpenditureHash()`.
 
 ## Setup & Deployment
 
-### Dependencies
-Ensure the corresponding `linkd-ts-sdk` is built and linked locally or available in the module resolution path.
+### Prerequisites
+
+`linkd-ts-sdk` must be built before this package:
+
+```bash
+cd ../linkd-ts-sdk && npm run build
+```
+
+### Install & Build
 
 ```bash
 npm install
+npm run build    # Compiles to dist/ — required before connecting to Claude Desktop
 ```
 
-### Build
-
-Compiles the TypeScript source into optimized, environment-agnostic ESM modules.
+### Development
 
 ```bash
-npm run build
+npm run dev    # ts-node watch mode
 ```
 
-### Execution
+## Claude Desktop Integration
 
-Initiates the server over standard input/output.
+Add to `claude_desktop_config.json`:
 
-```bash
-npm start
+```json
+{
+  "mcpServers": {
+    "linkd-protocol": {
+      "command": "node",
+      "args": ["/absolute/path/to/linkd-mcp-server/dist/index.js"]
+    }
+  }
+}
 ```
+
+## Transport
+
+`StdioServerTransport` — communicates via stdin/stdout. No network listener. No port. No authentication surface.
+
+## Zod Validation
+
+All tool inputs are validated with Zod before reaching `linkd-ts-sdk`. Validation errors are returned as structured text so agents can self-correct:
+
+```
+Argument Validation Failed: [ZodError details]
+Runtime Error: [message]
+```
+
+Do not catch and swallow these — they are the agent's feedback loop.
+
+## Network
+
+Hardcoded to `testnet` in `src/index.ts`. The `audit_expenditure_anchor` tool hits `https://horizon-testnet.stellar.org`.
+
+Before mainnet deployment: change `network: "testnet"` → `network: "mainnet"` and update the Horizon URL. That is the only required change.
+
+## Dependency Chain
+
+```
+linkd-mcp-server
+  └── linkd-ts-sdk (local — file:../linkd-ts-sdk — must be built first)
+  └── @modelcontextprotocol/sdk
+  └── @stellar/stellar-sdk ^14.5.0
+  └── zod
+```
+
+> **Version divergence**: `linkd-mcp-server` depends on `@stellar/stellar-sdk ^14.5.0` while `linkd-ts-sdk` uses `^13.3.0`. This is a latent incompatibility. Stellar SDK has breaking changes between minor versions. Both packages must be aligned before mainnet deployment.
+
+If `linkd-ts-sdk` changes, run `npm run build` in `linkd-ts-sdk/` first, then rebuild this package.
 
 ## Security
 
-This service assumes a trusted relationship with the invoking AI agent or client application. While it guarantees structural validity of the XDR payloads via the SDK and prevents execution halts via Zod schemas, the business logic of *when* to invoke these tools must be governed by the parent application's intelligence layer.
+This service assumes a trusted relationship with the invoking AI agent or client application. It guarantees structural validity of XDR payloads via the SDK and prevents execution halts via Zod schemas. The business logic of *when* to invoke these tools must be governed by the parent application's intelligence layer.
 
 ## License
 
